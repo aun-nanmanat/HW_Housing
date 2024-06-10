@@ -1,0 +1,838 @@
+---
+title: "Prediction on the rent of flats and houses in Delhi"
+author: "Nanmanat Disayakamonpan"
+format:   
+  html:                     
+    standalone: true        # These are some YAML configurations which are not essential but you may play with:
+                            # standalone means that quarto renders to a html-file with a header 
+                            # and all css javascript needed
+    embed-resources: true   # The html will also embed all figures you produce 
+                            # (usually they would be in a directory). So differently from traditional html files
+                            # this html file would be self-contained. You could for example email it as one file 
+    code-fold: true         # We enable the code folding such that we only need to look at code if we want
+                            # More info at https://quarto.org/docs/output-formats/html-publishing.html
+    number-sections: true   # We number the sections
+    toc : true              # Table of contents make navigation in longer files easier
+---
+
+In this analysis, I explore the `delhi` dataframe to gain insights into housing prices in Delhi, India. Subsequently, I aim to develop predictive models for estimating the rent of both flats and houses in the city. 
+
+# Data Overview and Preparation
+
+The dataset shown in this report is from https://www.kaggle.com/datasets/goelyash/housing-price-dataset-of-delhiindia. Here, there are many interesting variables in the dataset:
+
+**VARIABLE DESCRIPTION**
+    + ***price***
+        - the total price of an individual house or a flat in Delhi.
+    + ***area***
+        - The size of the houses/flats or how big the houses or the flats are
+    + ***bedrooms, bathrooms, balcony, parking, and lift***
+        - These variables are numerical variables, which show us the number of the facilities of the houses/flats have. 
+    + ***Furnished_status***
+        - Show the status of the houses/flats whether they are furnished, semi-furnished, or unfurnished.
+    + ***status***
+        - Show whether the flat/house is still under construction or is ready to move in.   
+    + ***neworold***
+        - Shows if the property that is being sold, is a new property or its being resale.
+    + ***price_sqft***
+        - Shows that how much a square feet costs for a specific individual house/flat 
+
+Additionally, leveraging these variables, we can effectively discern and predict the variations in price ranges across different properties in Delhi.
+
+```{r}
+#| label: packages-data
+#| message: false 
+#| echo: false
+library(tidyverse)
+library(dplyr)
+library(skimr)
+library(caret)
+library(leaflet)
+library(forcats)
+library(viridis)
+library(corrplot)
+library(tidymodels)
+library(modelsummary)
+library(tibble)
+library(kableExtra)
+
+# Download the data
+file_path <- file.path("~/Downloads", "Delhi_v2.csv")
+delhi <- read.csv(file_path) # Read the CSV file
+#skim(delhi)
+colnames(delhi)
+#str(delhi)
+```
+
+# Pre-Processing
+
+## Units
+
+To facilitate this analysis, I must convert certain variables in the original dataset, which are currently expressed in units or currency used in India. For instance, the housing prices are currently in Indian Rupees, the area is measured in square feet, and the price_sqft indicates the cost per square foot in Indian Rupees. Before proceeding with this analysis, I plan to standardize these variables by converting them to square meters and Euros. This conversion is essential for easier interpretation of the units in a more universally understood context.
+
+```{r}
+#| label: preprocessing-units
+#| echo: false
+# 1. Units
+delhi$area_sqm <- delhi$area * 0.0929
+
+conversion_factor <- 0.011 
+delhi$price_eur <- delhi$price * conversion_factor
+delhi <- delhi %>%
+  mutate(price_per_sqm = price_eur / area_sqm)
+```
+
+## NAs
+
+Some variables, such as Balcony, Parking, and Lift, exhibit a significant number of missing values. Specifically, the Lift variable contains 6005 NA observations. Opting against the removal of rows containing NA values to prevent information loss and biased results, I have chosen to impute all missing values with 0s for these three variables. This decision is based on the assumption that the absence of data (NA) signifies that the house/flat does not have a balcony, parking space, or lift.
+
+```{r}
+#| label: NAs
+#| echo: false
+# 2. NAs
+missing_values <- colSums(is.na(delhi))
+
+delhi <- delhi %>%
+  mutate(across(where(is.numeric), ~if_else(is.na(.), 0, .)))
+
+#sapply(delhi, function(x) is.numeric(x) && any(x == 0)) #to check which variable have 0
+#colSums(is.na(delhi))
+```
+
+**Pros and Cons of Replacing Missing Values with 0**
+
+**Pros:**
+
+-   It helps in maintaining the structure of the dataset.
+
+-   It allows to perform calculations on the variables without encountering NA issues.
+
+**Cons:**
+
+-   It might introduce bias, especially if missing values were not truly zero.
+
+-   It assumes that missing values mean absence rather than unknown or undefined.
+
+## Log-Transformation
+
+Examining the numerical variables and attempting to visualize them through histograms, it becomes evident that these variables exhibit a positive skew. Recognizing that skewed variables can benefit from log transformation to achieve a more normal distribution, we intend to apply this transformation for improved data distribution within each specific variable.
+
+```{r}
+#| label: preprocessing-log
+#| echo: true
+#This line selects numeric columns from the delhi dataset excluding the longitude and latitude columns. The result is a vector of column names (cols_no_lonlat) for numeric variables that will undergo log transformation.
+cols_no_lonlat <- delhi |> 
+  select(where(is.numeric), -c(longitude, latitude)) |> 
+  names()
+
+delhi <- delhi |> 
+  mutate(
+    across(
+      where(~is.numeric(.x) && min(.x) == 0),
+      ~.x + 1)) |> #the code uses the mutate(across()) function to add 1 to all numeric columns in the dataset (delhi) where the minimum value is 0. This is done to avoid issues with log transformation when the value is 0.
+  mutate(
+    across(
+      all_of(cols_no_lonlat),
+      ~log(.x),
+      .names = "{.col}_log"
+    )
+  ) #the code applies the log transformation to all numeric columns identified in the cols_no_lonlat vector (excluding longitude and latitude). The result is stored in new columns with names suffixed by "_log".
+```
+
+## Spliting the Data
+
+Here I select a split 70% of the data for training and the rest for testing because I think 80% can provide more information for model training but could also leave less data for testing and validation. On the other hand, a smaller training set may lead to underfitting. Therefore, I think 70% for training set share is the best choice for the split.
+Furthermore, this division of the data serves the dual purpose of preventing over-fitting and furnishing a dependable estimate of the model's performance.
+
+```{r}
+#| label: trainandtestdata
+#| echo: true
+set.seed(123)  # for reproducibility
+train_index <- sample(1:nrow(delhi), 0.7 * nrow(delhi))
+
+# Create training and testing datasets
+delhi_train <- delhi[train_index, ]
+delhi_test <- delhi[-train_index, ]
+```
+
+# Exploratory Analysis
+
+## Mapping Space and Price per Square Meter
+
+### Original Price per Square Meter of Flats and Houses in Delhi
+
+In this map, each data point is assigned a color based on its original price per square meter. Darker red colors may represent higher prices, and dark blue colors may represent lower prices. This map can show us a direct visualization of the spatial distribution of housing prices in Delhi. It allows us to quickly identify areas with higher or lower average prices. As the graph shown above, we can see that the cheaper price per square meter is around the outer area of the city center. Meanwhile the more expensive area is close to the city center of Delhi.
+
+```{r}
+#| label: originalpricepersqm
+#| echo: false
+# Create a scatter plot with color representing original price per square meter
+ggplot(data = delhi, aes(x = longitude, y = latitude, color = price_per_sqm)) + 
+  geom_point(shape = 17) +
+  labs(title = "Map of original price per sqm of the properties in Delhi",
+       color = "Price per sqm (Euro)") +
+  scale_color_viridis(option = "H") +
+  theme_minimal()
+```
+###Log-Transformed Price per Square Meter of Flats and Houses in Delhi
+
+In this map, colors are assigned based on the log-transformed price per square meter. Darker red and blue colors may still represent higher and lower prices, respectively, but now the scale is logarithmic. I used log transformation to handle skewed data and make it easier to visualize the relative differences in lower price ranges.
+
+```{r}
+#| label: log-pricepersqm
+#| echo: false
+ggplot(data = delhi, aes(x = longitude, y = latitude, color = price_per_sqm_log)) + 
+  geom_point(shape = 17) +
+  labs(title = "Map of log-transformed price per sqm of the properties in Delhi",
+       color = "Log-price per sqm") +
+  scale_color_viridis(option = "H") +
+  theme_minimal()
+```
+Generally, the colors of the second map may be more informative to enhance the visibility of the price ranges and highlight the relative differences across a wide range of prices in the city of Delhi. However, **I would prefer using original price per square meter** because it is easier to interpret each data point based on the original price per square meter and allow us to quickly identify areas with higher and lower average prices.
+
+### Original Area per Square Meter of Flats and Houses in Delhi
+
+In this map, prominent clusters of dark blue colors across the city of Delhi indicate areas with generally smaller absolute sizes of flats and houses. However, the presence of some green and dark red data points signifies specific areas characterized by particularly spacious flats and houses, offering a nuanced view of the diverse housing sizes within the city.
+
+```{r}
+#| label: originalareapersqm
+#| echo: false
+# Create a scatter plot map to visualize size of the flats and houses for each type of building
+ggplot(data = delhi, aes(x = longitude, y = latitude, color = area_sqm, shape = type_of_building)) + 
+  geom_point() +
+  labs(title = "Map of original area per sqm of the flats and houses in Delhi",
+       color = "Area per sqm",
+       shape = "Type of building") +
+  scale_color_viridis(option = "H") +
+  theme_minimal()
+```
+### Log-Transformed Area per Square Meter of Flats and Houses in Delhi
+
+Conversely, using the log-transformed area per square meter allows for the accentuation of areas where the distribution of the original area per square meter was skewed. This transformation serves to normalize or spread out the values, providing a more insightful visualization and enhancing our ability to perceive relative flats and housing size variations across the city. As the graph shown above, the map based on log-transformed area per square meter effectively highlights that in the north of Delhi may have smaller sizes. Meanwhile, the larger apartments and houses may provided more in the south of the city.
+
+```{r}
+#| label: log-areapersqm
+#| echo: false
+# Create a scatter plot map to visualize size of the flats and houses for each type of building
+ggplot(data = delhi, aes(x = longitude, y = latitude, color = area_sqm_log, shape = type_of_building)) + 
+  geom_point() +
+  labs(title = "Map of log-area per sqm of the flats and houses in Delhi",
+       color = "Log-area per sqm",
+       shape = "Type of building") +
+  scale_color_viridis(option = "H") +
+  theme_minimal()
+```
+When it comes to the two maps illustrating the area of each building type, I favor the original variable. While the logarithmic transformation is beneficial for handling skewness, it has a tendency to obscure the true numerical significance and lacks representativeness of the unit of area. In contrast, the original variable delivers a clearer and more faithful depiction of the data.
+
+## Categories and Price
+
+When contemplating a property purchase, it is crucial to weigh various factors, including the choice between a flat or an individual house, opting for a new construction or a resale property, deciding on furnished or unfurnished spaces, and determining whether to go for a ready-to-move unit or one under construction.
+
+To effectively analyze and illustrate the disparities in prices associated with these elements, I created a series of boxplots and used **the log-transformed price per square meter (price_per_sqm_log)** because this price per square meter approach standardizes the comparison by considering the price relative to the size of the property. It helps in assessing the cost efficiency in terms of the space we are getting for the price. Moreover, the data of the original price per square meter has skewed distribution, so I used log-transformation approach to visualize better in terms of the relative differences in price ranges.
+
+### Individual Houses and Flats
+
+```{r}
+#| label: houseandflat
+#| echo: false
+ggplot(delhi, aes(x = type_of_building, y = price_per_sqm_log, fill = type_of_building)) +
+  geom_boxplot() +
+  labs(title = "Price differences between houses and flats in Dehli",
+       x = "Type of buidling",
+       y = "Log-price per sqm",
+       fill = "Type of building") +
+  theme_minimal()
+```
+
+### New or Resales Properties
+
+```{r}
+#| label: newandresale
+#| echo: false
+ggplot(delhi, aes(x = neworold, y = price_per_sqm_log, fill = neworold)) +
+  geom_boxplot() +
+  labs(title = "Price differences between new and resales properties in Delhi",
+       x = "",
+       y = "Log-price per sqm",
+       fill = "Option") +
+  theme_minimal()
+```
+
+### Furnished or Unfurnished
+
+```{r}
+#| label: furnished-unfurnished
+#| echo: false
+Furnished_rename <- c("Not-Specified", "Furnished", "Semi-Furnished", "Unfurnished")
+
+# Replace empty strings and NA values with "Not-Specified"
+delhi$Furnished_status <- factor(replace(delhi$Furnished_status, delhi$Furnished_status == "" | is.na(delhi$Furnished_status), "Not-Specified"), 
+                                  levels = Furnished_rename)
+
+# Create the boxplot
+ggplot(delhi, aes(x = Furnished_status, y = price_per_sqm_log, fill = Furnished_status)) +
+  geom_boxplot() +
+  labs(title = "Price differences between furnished and unfurnished properties in Delhi",
+       x = "Furnished Status",
+       y = "Log-price per sqm",
+       fill = "Furnished Status") +
+  theme_minimal()
+```
+
+### Ready or Under-Construction Properties
+
+```{r}
+#| label: ready-construction
+#| echo: false
+status_rename <- c("Not-Specified", "Ready to Move", "Under Construction")
+
+delhi$Status <- factor(replace(delhi$Status, delhi$Status == "" | is.na(delhi$Status), "Not-Specified"), 
+                                  levels = status_rename)
+
+ggplot(delhi, aes(x = Status, y = price_per_sqm_log, fill = Status)) +
+  geom_boxplot() +
+  labs(title = "Price differences between ready and under-construction properties in Delhi",
+       x = "Property Status",
+       y = "Log-price per sqm",
+       fill = "Property Status") +
+  theme_minimal()
+```
+
+According to the series of boxplots shown above, **the best strategy to save money** is to buy ***a flat or a house which is resale, unfernished and ready to move***.
+
+## Size and Price
+
+### Original Apartment Size VS Total Price with Parking Availability 
+
+At this stage, I aim to explore the relationship between apartment size and total price, taking into account the influence of parking availability. I will depict this connection using two sets of variables: the original area and price data, as well as the log-transformed counterparts. By comparing these two visualizations, I intend to illustrate the differences and assess which representation provides more informative insights into the impact of parking availability on the size and price dynamics of apartments.
+
+```{r}
+#| label: parking
+#| echo: false
+flat_parking <- delhi %>% 
+  filter(type_of_building == "Flat")
+
+flat_parking$has_parking <- factor(ifelse(flat_parking$parking > 1, "With parking", "Without parking"), 
+                                   levels = c("With parking", "Without parking"))
+
+# Create a scatter plot with regression lines
+suppressWarnings({
+  ggplot(flat_parking, aes(x = area_sqm, y = price_eur, color = price_per_sqm, 
+                           group = has_parking, linetype = has_parking)) +
+    geom_point(size = 3, alpha = 0.5) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", formula = y ~ x, warning = FALSE) +
+    labs(title = "Apartment size vs. total price with parking availability",
+         x = "Apartment Size (sqm)",
+         y = "Total Price (euro)",
+         color = "Price per sqm",
+         linetype = "Parking") +
+    scale_color_viridis(option = "H") +
+    theme_minimal()
+})
+```
+
+### The logarithm of Apartment Size VS Log-Transformed Total Price with Parking Availability 
+
+As the graphs shown about the size of the apartments and the total price with parking and balcony availability, we can see **the main difference between the graphs that each data point are more spread with log-transformed data**, compared to the original one. 
+
+```{r}
+#| label: parking-log
+#| echo: false
+flat_parking <- delhi %>% 
+  filter(type_of_building == "Flat")
+
+flat_parking$has_parking <- factor(ifelse(flat_parking$parking > 1, "With parking", "Without parking"), 
+                                   levels = c("With parking", "Without parking"))
+
+suppressWarnings({
+  ggplot(flat_parking, aes(x = area_sqm_log, y = price_eur_log, color = price_per_sqm_log, 
+                           group = has_parking, linetype = has_parking)) +
+    geom_point(size = 3, alpha = 0.5) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", formula = y ~ x, warning = FALSE) +
+    labs(title = "Log-apartment size vs. total log-price with parking availability",
+         x = "Log-Apartment Size (sqm)",
+         y = "Total Log-Price (euro)",
+         color = "Log-Price per sqm",
+         linetype = "Parking") +
+    scale_color_viridis(option = "H") +
+    theme_minimal()
+})
+```
+
+However, I think **the first approach with the original area per square meter and the original total price** is more informative than the log-transformation because we can interpret and relate the colors to our real-world perception of high and low prices.
+
+### Original Apartment Size VS Total Price with Balcony Availability 
+
+Here, I have generated a scatter plot depicting the relationship between apartment size and total price. The points are color-coded based on the price per square meter, and I have incorporated two regression lines—one inclusive of balcony considerations and the other without. To facilitate this, I introduced a new variable called "has_balcony." This variable is transformed into a factor with two levels: "With balcony" if the Balcony variable has more than zero balconies (1 and above) for the i-th observation, and "Without balcony" otherwise. The same approach is applied to the parking variable in the aforementioned scatter plots.
+
+```{r}
+#| label: balcony
+#| echo: false
+flat_balcony <- delhi %>% 
+  filter(type_of_building == "Flat")
+
+flat_balcony$has_balcony <- factor(ifelse(flat_balcony$Balcony > 1, "With balcony", "Without balcony"), 
+                                   levels = c("With balcony", "Without balcony"))
+
+suppressWarnings({
+  ggplot(flat_balcony, aes(x = area_sqm, y = price_eur, color = price_per_sqm, 
+                         group = has_balcony, linetype = has_balcony)) +
+    geom_point(size = 3, alpha = 0.5) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", formula = y ~ x, warning = FALSE) +
+    labs(title = "Apartment size vs. total price with balcony availability",
+       x = "Apartment Size (square meters)",
+       y = "Total Price (euro)",
+       color = "Price per sqm",
+       linetype = "Balcony") +
+    scale_color_viridis(option = "H") +
+    theme_minimal()
+})
+```
+### The logarithm of Apartment Size VS Log-Transformed Total Price with Balcony Availability
+
+Here, I have recreated the previous scatter plot, but with a twist—this time, I have opted to employ the logarithm of each variable.
+
+```{r}
+#| label: balcony-log
+#| echo: false
+flat_balcony <- delhi %>% 
+  filter(type_of_building == "Flat")
+
+flat_balcony$has_balcony <- factor(ifelse(flat_balcony$Balcony > 1, "With balcony", "Without balcony"), 
+                                   levels = c("With balcony", "Without balcony"))
+
+suppressWarnings({
+  ggplot(flat_balcony, aes(x = area_sqm_log, y = price_eur_log, color = price_per_sqm_log, 
+                         group = has_balcony, linetype = has_balcony)) +
+    geom_point(size = 3, alpha = 0.5) +
+    geom_smooth(method = "lm", se = TRUE, color = "black", formula = y ~ x, warning = FALSE) +
+    labs(title = "Log-apartment size vs. total log-price with balcony availability",
+       x = "Log-Apartment Size (sqm)",
+       y = "Total Log-Price (euro)",
+       color = "Log-Price per sqm",
+       linetype = "Balcony") +
+    scale_color_viridis(option = "H") +
+    theme_minimal()
+})
+```
+As I mentioned earlier, the rationale applied to the first pair of scatter plots for parking holds true for this set as well. I maintain the belief that the initial scatter plot provides more informative insights, presenting real values in a straightforward manner that allows for simpler interpretation compared to its logarithmic counterpart.
+
+# Preliminaries and Hypothesis Testing
+
+## Spliting the Data and Setting the Algorithm
+
+Before moving on to hypothesis testing, I will conduct a preliminary stage by splitting the data set into 60% for training data and the rest for testing data.
+
+```{r}
+#| label: preliminaries
+#| echo: true
+set.seed(0421)
+
+data_split <- initial_split(delhi, prop = 0.6) 
+
+# Create data frames for the two sets:
+train_data <- training(data_split)
+test_data  <- testing(data_split)
+
+Regression_OLS <- linear_reg() |>
+  set_mode("regression") |> # Machine learning: regression or classification
+  set_engine("lm")
+```
+
+## Two Variables and Two Hypotheses
+
+### An Overview of the Correlations in the Data
+
+For the first start, I would like to create a correlation matrix to understand an overview of the correlations in the data and which variables are high correlated with total price. As the output shown, you can see that the total price has high correlation with `area_sqm`, `Bathrooms`, and `Bedrooms`.
+
+```{r}
+#| label: correlationmatrix
+#| echo: false
+train_data %>% 
+  select(area_sqm, price_eur, Bathrooms, Bedrooms, price_per_sqm, Balcony, Lift, parking) %>% 
+  cor() %>% 
+  corrplot()
+```
+### Two Predictor Variables Selection and Two Hypotheses
+
+Based on the exploratory analysis part, I select two variables which are **area_sqm (area per square meter)** and **parking** which I expect to have a substantial influence on housing price in Delhi.
+
+Next, I will formulate 2 hypotheses about these variables as follows:
+
+**Hypothesis 1:**
+
+-   ***Null Hypothesis (H0):*** There is no significant relationship between the size of the property (area_sqm) and housing prices.
+
+-   ***Alternative Hypothesis (H1):*** There is a significant positive/negative relationship between the size of the property (area_sqm) and housing prices.
+
+-   ***Explanation:*** If the null hypothesis is rejected, it suggests that the size of the property has a significant impact on housing prices. The direction of the relationship (positive/negative) will indicate whether larger properties tend to have higher or lower prices.
+
+**Hypothesis 2:**
+
+-   ***Null Hypothesis (H0):*** There is no significant relationship between the parking and housing prices.
+
+-   ***Alternative Hypothesis (H1):*** There is a significant relationship between the parking and housing prices.
+
+-   ***Explanation:*** If the null hypothesis is rejected, it implies that the parking has a significant effect on housing prices. This could mean that either an increase or decrease in the number of parking is associated with a corresponding increase or decrease in housing prices.
+
+## Pre-processing steps
+
+### Identify Missing Values
+
+As the original dataset `delhi`, there are two variables `Balcony` and `parking` that have missing value. ***However, I already identified and handled those missing values in the previous step***. In the first pre-processing step before developing predictive models, it is necessary to check whether there are any missing values in the response variable `price_eur` and in these two predictor variables `area_sqm` and `parking` because missing values in these variables can affect the performance of my predictive model and I would like to ensure the overall quality of my dataset to not lead to biased or incomplete analysis.
+
+```{r}
+#| label: pre-processing1 
+#| echo: true
+# 1. check if these response/predictor variables have any missing values
+summary(is.na(delhi$price_eur))
+summary(is.na(delhi$area_sqm)) 
+summary(is.na(delhi$parking))
+```
+### Log-Transformation for Skewed Data
+
+Another pre-processing step I used is **log transformation** becauseI noticed that the response variable `price_eur` and the predictor variables `area_sqm` have skewed distributions which can impact the performance of models to be violated. Since I would like to mitigate the impact of extreme values and make the distribution more symmetrical, I decided to use log-transformation with these variables to improve the performance of the models that require more balanced data. 
+
+```{r}
+#| label: pre-processing2
+#| echo: true
+# 2. check if these response/predictor variables have normal or skewed distribution
+hist(delhi$price_eur) #skewed distribution
+hist(delhi$price_eur_log) # normal distribution
+hist(delhi$area_sqm) #skewed distribution
+hist(delhi$area_sqm_log) # normal distribution
+
+suppressWarnings({
+  train_data %>% 
+    ggplot(aes(x = area_sqm, y = price_eur)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE, formula = y ~x, warning = FALSE) +
+    theme_light()
+})
+
+suppressWarnings({
+  train_data %>% 
+    ggplot(aes(x = area_sqm_log, y = price_eur_log)) +
+    geom_point() +
+    geom_smooth(method = "lm", se = FALSE, formula = y ~x, warning = FALSE) + 
+    theme_light()
+})
+```
+
+As mentioned, addressing missing values and skewed distributions in the pre-processing step is crucial to build and increase the robustness and accuracy of the predictive models.
+
+## Fitting the Model (Intercept the Model)
+
+Another step is **to fit the model** by using the training data to estimate the parameters of the models such as the intercept and coefficients for each predictor variable.
+
+```{r}
+#| label: TM0-Model
+#| echo: true
+TM0 <- fit(Regression_OLS, price_eur ~ 1, data = train_data)
+#glance(TM0)
+rmse(as.data.frame(cbind(train_data$price_eur, TM0$fit$fitted.values)), V1, V2)
+```
+
+As you can see, the RMSE value of 79811.5 indicates the average absolute difference between the actual prices (price_eur) and the predicted prices by the model. In other words, on average, the model's predictions are off by approximately 79811.5 units of the currency used for the prices.
+
+## Model Development
+
+As this stage, I selected two variables **`area_sqm`** and **`parking`** as predictors which I think they may influence housing price. Then, I developed various predictive models to see which models will perform the best for predicting the housing price in Delhi.
+
+### Model 1: TM1 Model
+
+```{r}
+#| label: TM1-Model
+#| echo: true
+TM1 <- fit(Regression_OLS, price_eur ~ area_sqm, data = train_data)
+tidy(TM1)
+glance(TM1)
+```
+
+**Model 1 (TM1):**
+
+1.  **Coefficients:** The coefficient for `area_sqm` is 1014.41. This suggests that for each additional square meter increase in the area, the predicted price_eur increases by 1014.41 euros.
+
+2.  **Standard Errors:** The standard error for `area_sqm` is 9.16.
+
+3.  **Significance:** Both intercept and `area_sqm` have very small p-values (close to zero), indicating that they are statistically significant.
+
+4.  **Goodness of Fit:** The R-squared value is 0.7255. This means that approximately 72.55% of the variability in price_eur is explained by the model. The R-squared value is relatively high, suggesting that the model explains a substantial portion of the variability in price_eur.
+
+### Model 2: TM2 Model
+
+```{r}
+#| label: TM2_Model
+#| echo: true
+TM2 <- fit(Regression_OLS, price_eur ~ parking, data = train_data)
+tidy(TM2)
+glance(TM2)
+```
+
+**Model 2 (TM2):**
+
+1.  **Coefficients:** The coefficient for `parking` is -33.77. This suggests that, holding other variables constant, each unit increase in the parking variable is associated with a decrease in the predicted price_eur by 33.77 euros.
+
+2.  **Standard Errors:** The standard error for `parking` is 31.07.
+
+3.  **Significance:** The p-value for parking is 0.2772, which is larger than the typical significance level of 0.05. This suggests that the variable parking may not be statistically significant in predicting price_eur.
+
+4.  **Goodness of Fit:** The R-squared value is 0.0002545. This indicates that the model explains a very small proportion of the variability in price_eur. In other words, the predictor variable `parking` does not contribute much to explaining the variation in the response variable or the model has very low explanatory power.
+
+### Model 3: TM3 Model
+
+In real estate, the number of **bedrooms** and **bathrooms** are fundamental features that influence housing prices. On the other hand, the presence of **a balcony** is an additional feature that can impact the overall price of a property. Moreover, based on the correlation matrix, `Bedrooms` and `Bathrooms` are highly correlated with `price_eur` (total price), indicating a strong relationship.
+
+As mentioned, I selected `Bathrooms`, `Bedrooms` and `Balcony` as **control variables** and add in the following models to see whether the predictive models will perform better than the previous models.
+
+```{r}
+#| label: TM3-Model
+#| echo: true
+TM3_Model <- recipe(
+  price_eur ~ area_sqm + Bathrooms + Bedrooms + Balcony,
+  data = train_data
+)
+summary(TM3_Model)
+
+TM3 <- fit(Regression_OLS, price_eur ~ area_sqm + Bathrooms + Bedrooms + Balcony, data = train_data)
+tidy(TM3)
+glance(TM3)
+```
+
+**Model 3 (TM3):**
+
+1. **Coefficients:**
+
+-   The coefficient for `area_sqm` is 920.56. For each additional square meter of area, the estimated price increases by 920.56 euros.
+
+-   The coefficient for `Bathrooms` is 10,237.59. This suggests that, each additional bathroom is associated with an increase in price by 10,237.59 euros.
+
+-   The coefficient for `Bedrooms` is -578.10. This suggests that, each additional bedroom is associated with a decrease in price by 578.10 euros. This result might seem strange, and I need to consider interactions with other variables.
+
+-   The coefficient for `Balcony` is -939.48. This suggests that, each additional balcony is associated with a decrease in price by 939.48 euros.
+
+2. **Standard Errors:** all the standard errors seem reasonable, suggesting that the coefficient estimates are likely reliable.
+
+-   The standard error for `area_sqm` is 15.43.
+
+-   The standard error for `Bathrooms` is 1280.45.
+
+-   The standard error for `Bedrooms` is 1111.33.
+
+-   The standard error for `Balcony` is 433.44.
+
+3. **Significance:**
+
+-   `area_sqm` and `Bathrooms`: These variables have very low p-values (close to zero), indicating that they are statistically significant predictors of the price.
+
+-   `Bedrooms` and `Balcony`: Bedrooms have a p-value greater than 0.05, suggesting it might not be a statistically significant predictor. Balcony, with a p-value of 0.03, is statistically significant at the 0.05 level.
+
+4. **Goodness of Fit:** The R-squared value of 0.7301 indicates that the model explains approximately 73.01% of the variability in the response variable (price). This suggests a reasonably good fit.
+
+In summary, this model suggests that `area_sqm` and `Bathrooms` are strong predictors of the housing price, while `Bedrooms` and `Balcony` may have less impact.
+
+### Model 4: TM4 Model
+
+```{r}
+#| label: TM4-model
+#| echo: true
+TM4 <- fit(Regression_OLS, price_eur ~ parking + Bathrooms + Bedrooms + Balcony, data = train_data)
+tidy(TM4)
+glance(TM4)
+```
+
+**Model 4 (TM4):**
+
+1. **Coefficients:**
+
+-   The coefficient for `parking` is -7.73. Each additional parking space is associated with a decrease in price by 7.73 euros.
+
+-   The coefficient for `Bathrooms` is 51,025.25. This suggests that, each additional bathroom is associated with an increase in price by 51,025.25 euros.
+
+-   The coefficient for `Bedrooms` is 17,908.05. This suggests that, each additional bedroom is associated with an increase in price by 17,908.05 euros.
+
+-   The coefficient for `Balcony` is 2,687.60. This suggests that, ach additional balcony is associated with an increase in price by 2,687.60 euros.
+
+2. **Standard Errors:** all the standard errors seem reasonable, suggesting that the coefficient estimates are likely reliable.
+
+-   The standard error for `area_sqm` is 21.48.
+
+-   The standard error for `Bathrooms` is 1439.08.
+
+-   The standard error for `Bedrooms` is 1418.87.
+
+-   The standard error for `Balcony` is 570.87.
+
+3. **Significance:**
+
+-   The `parking` variable has a p-value greater than 0.05, suggesting it might not be a statistically significant predictor.
+
+-   However, all other variables have very low p-values (close to zero), indicating that they are statistically significant predictors of the price.
+
+4. **Goodness of Fit:** The R-squared value of 0.5231 indicates that the model explains approximately 52.31% of the variability in the response variable (price). This suggests a moderate fit.
+
+In summary, this model suggests that `Bathrooms`, `Bedrooms`, and `Balcony` are statistically significant predictors of housing price. However, `parking` does not appear to be a significant predictor in this model.
+
+## Model with Pre-processing Steps: PCA or Log-Transformation
+
+From my perspective, I want to develop models with both pre-processsing steps (PCA or Log-transformation) to see the differences between them. 
+
+```{r}
+#| label: T3Mln-model
+#| echo: true
+#names(train_data) # get a list of variable names to speed this up
+
+TM3ln_Model <- recipe(price_eur_log ~ ., # we need to select all variables first for pre-processing to work
+                      data = train_data) %>% # same as above
+  step_log(area_sqm, offset =  1, base = 10) %>% # log-transform predictor
+  step_log(Bathrooms, offset =  1, base = 10) %>% 
+  step_log(Bedrooms, offset =  1, base = 10) %>% 
+  step_log(Balcony, offset =  1, base = 10) %>% 
+  step_rm("price_eur", # remove the old response / dependent variable
+          "X", "price", "Address", "area", "latitude", "longitude", # remove all predictors not to be included
+          "Status", "neworold", "parking", "Furnished_status", "Lift", 
+          "Landmarks", "type_of_building", "desc", "Price_sqft", "price_per_sqm",
+          "X_log","price_log", "area_log", "Bedrooms_log", "Bathrooms_log", "Balcony_log",
+          "parking_log", "Lift_log", "Price_sqft_log", "area_sqm_log", "price_per_sqm_log") 
+summary(TM3ln_Model) 
+TM3ln_Model_prep <- prep(TM3ln_Model, training = train_data)
+
+PCA_Model <- recipe(price_eur ~., data = train_data) |>  # Full Model
+  step_rm(price_eur_log, # remove alternative response
+          "X", "price", "Address", "area", "latitude", "longitude", # remove the factors & other predictors
+          "Status", "neworold", "Furnished_status", "Landmarks", 
+          "type_of_building", "desc", "Price_sqft", "price_per_sqm","X_log",
+          "price_log", "area_log", "Bedrooms_log", "Bathrooms_log", "Balcony_log",
+          "parking_log", "Lift_log", "Price_sqft_log", "area_sqm_log", "price_per_sqm_log") |>
+  step_center(all_predictors()) %>%
+  step_scale(all_predictors()) %>%
+  step_pca(c("area_sqm", "Bedrooms", "Bathrooms"), num_comp = 1, prefix = "PC1main") %>%
+  step_pca(c("Balcony", "parking", "Lift"), num_comp = 1, prefix = "PC2additional") 
+summary(PCA_Model)
+
+# Execute the preprocessing (optional)
+PCA_Model_prep <- prep(PCA_Model, training = train_data)
+```
+Considering the characteristics of the original dataset, I prefer employing **log-transformation as a pre-processing step for the model**. This choice is suitable for the observed skewed distribution in both response and predictor variables. Log-transformation is beneficial in this context as it helps create more symmetric distributions, thereby enhancing model performance. Additionally, Principal Component Analysis (PCA) is a suitable approach when dealing with high-dimensional data, but since the current models do not involve a large number of predictors, the need for dimensionality reduction is not prominent in this case.
+
+## Training the Models and Getting the Training Errors
+
+```{r}
+#| label: trainmodels
+#| echo: true
+TM3_ols_wf <- workflow() %>%
+  add_recipe(TM3_Model) %>% ## terminology: this is the model
+  add_model(Regression_OLS) #
+
+TM3ln_ols_wf <- workflow() %>%
+  add_recipe(TM3ln_Model) %>% ## terminology: this is the model
+  add_model(Regression_OLS) # terminology!!! this is the algorithm we are adding
+
+PCA_ols_wf <- workflow() %>%
+  add_recipe(PCA_Model) %>% ## terminology: this is the model
+  add_model(Regression_OLS) 
+```
+
+## Training the Models 
+
+```{r}
+#| label: trainthemodels
+#| echo: true
+TM3_ols_fit <- fit(TM3_ols_wf, data = train_data)
+
+TM3ln_ols_fit <- fit(TM3ln_ols_wf, data = train_data)
+
+PCA_ols_fit <- fit(PCA_ols_wf, data = train_data)
+```
+
+## An Overview of the Model Results on Training Data
+
+### TM3 Model Result
+
+```{r}
+#| label: inspectresult1
+#| echo: true
+# TM3_ols_fit
+rmse(as.data.frame(cbind(train_data$price_eur, TM3_ols_fit$fit$fit$fit$fitted.values)),V1, V2)
+```
+
+### TM3ln Model Result
+
+```{r}
+#| label: inspectresult2
+#| echo: true
+# TM3ln Model on original price
+rmse(as.data.frame(cbind(train_data$price_eur, 
+                         exp(TM3ln_ols_fit$fit$fit$fit$fitted.values))),V1, V2)
+```
+
+### PCA Model Result
+
+```{r}
+#| label: inspectresult3
+#| echo: true
+# PCA_ols_fit
+rmse(as.data.frame(cbind(train_data$price_eur, PCA_ols_fit$fit$fit$fit$fitted.values)),V1, V2)
+```
+## Model Output on Testing Data
+
+```{r}
+#| label: trainwithtestdata
+#| echo: false
+predict(TM3_ols_fit, new_data = test_data)
+predict(TM3ln_ols_fit, new_data = test_data)
+predict(PCA_ols_fit, new_data = test_data)
+
+# Get the test error
+rmse(as.data.frame(cbind(test_data$price_eur, unlist(predict(TM3_ols_fit, new_data = test_data)))), V1, V2)
+rmse(as.data.frame(cbind(test_data$price_eur, exp(unlist(predict(TM3ln_ols_fit, test_data))))), V1, V2)
+rmse(as.data.frame(cbind(test_data$price_eur, unlist(predict(PCA_ols_fit, test_data)))), V1, V2)
+```
+
+The coefficients provide insights into how each predictor influences the model which are summarized as follows:
+
+```{r}
+#| label: modeloutput
+#| echo: false
+# how to the individual predictors influence the results
+
+# ... in the output viewer
+modelsummary(models = list(TM3_ols_fit, TM3ln_ols_fit, PCA_ols_fit), # list() for multiple models
+             estimate = "{estimate}{stars}",
+             stars = FALSE, # does not seem to work 
+             gof_map = c( "nobs", "r.squared", "BIC", "rmse"),
+             output = "default")
+```
+
+**An overview of the the model results indicate that:**
+
+- **TM3 model** has the lowest RMSE, indicating better predictive performance.
+
+- The R-squared values suggest that **TM3 model** has the highest goodness of fit among the models.
+
+In conclusion, based on the RMSE and R-squared values, **the TM3 Model** appears to be ***the best-performing model for predicting housing prices in Delhi***.
+
+When comparing the three models, it is evident that the first model (TM3 Model) stands out as the most effective, as it achieves the highest R-squared, explaining approximately 73% of the data with the original variables. The second model (TM3ln Model), incorporating logarithmic transformations, also performs well, explaining 72.4% of the variability in the response variable (price_euro). Notably, this outperforms the PCA model. The adjusted R-squared, which considers the number of predictors, aligns closely with the R-squared for both the first and second models, indicating well-fitting models. Overall, these results highlight the superiority of the original data model in capturing the variance in the response variable.
+
+In the first model, it is evident that both **area_meters** and **Bathrooms** are highly significant variables, underscoring their crucial roles in the model. Similarly, in the second model, these two variables maintain high significance, and the inclusion of **Bedrooms** adds to their importance. This consistent significance across models emphasizes the crucial role played by these specific variables in shaping the model outcomes.
+
+In this context, I would like to elaborate on the interpretation of my first model or the response based on the coefficients of predictor variables. For every additional square meter, the cost of the house/flat increases by 920.56 Euros. Similarly, each additional bathroom contributes to an increase of 10237.58 Euros in the overall cost. Conversely, for every extra bedroom, the cost decreases by 578.09 Euros. Notably, the presence of each additional balcony is associated with a reduction in the house cost by 939.47 Euros. These insights provide a nuanced understanding of how each variable influences the pricing in the model.
+
+```{r}
+#| label: trainandtestcomparison
+#| echo: false
+Results <- tibble(models = c("TM3", "TM3ln", "PCA"),
+       RMSEtrain = c(sqrt(mean((TM3_ols_fit$fit$fit$fit$fitted.values - train_data$price_eur)^2)),
+                     sqrt(mean((exp(TM3ln_ols_fit$fit$fit$fit$fitted.values) - train_data$price_eur)^2)),
+                    sqrt(mean((PCA_ols_fit$fit$fit$fit$fitted.values - train_data$price_eur)^2))),
+       RMSEtest = c(sqrt(mean((unlist(predict(TM3_ols_fit, test_data)) - test_data$price_eur)^2)),
+                    sqrt(mean((exp(unlist(predict(TM3ln_ols_fit, test_data))) - test_data$price_eur)^2)),
+                    sqrt(mean((unlist(predict(PCA_ols_fit, test_data)) - test_data$price_eur)^2))))
+Results
+
+Results_table <- kable(Results, "html") %>%
+  kable_styling()
+
+Results_table
+```
+**The original model (TM3 Model)** showcases commendable predictive performance, as evidenced by its lower RMSE values, which are indicative of superior accuracy. Surprisingly, **the Logarithmic model (TM3ln Model)** displays higher RMSE values in comparison to the original model (TM3 Model), suggesting that the log-transformation of certain variables may not enhance predictive accuracy in this particular context. Despite dimensionality reduction, **the PCA model** yields higher RMSE values on both training and test datasets, signifying a higher level of prediction error compared to both the original and log-transformed models. Consequently, while the original model (TM3 Model) demonstrates solid predictive capabilities, the Log-Transformed model (TM3ln Model) does not surpass it, and the PCA model, despite reducing dimensionality, falls short in predictive accuracy when compared to the other two models.
